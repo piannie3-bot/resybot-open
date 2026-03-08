@@ -22,6 +22,10 @@ scheduler = BackgroundScheduler()
 scheduler.add_jobstore(MemoryJobStore(), 'default')
 scheduler.start()
 
+# Thread synchronization locks
+_file_lock = threading.Lock()  # Lock for all file I/O operations
+_running_tasks_lock = threading.Lock()  # Lock for running_tasks dictionary
+
 running_tasks = {}
 
 # File paths for storing data
@@ -34,17 +38,60 @@ RESERVATIONS_FILE = 'resrevations.json'
 SCHEDULED_TASKS_FILE = 'scheduled_tasks.json'
 RESTAURANT_CACHE_FILE = 'restaurant_cache.json'
 
-# Load existing data
+# Load existing data (thread-safe)
 def load_data(file, default):
-    if os.path.exists(file):
-        with open(file, 'r') as f:
-            return json.load(f)
-    return default
+    with _file_lock:
+        if os.path.exists(file):
+            try:
+                with open(file, 'r') as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, IOError):
+                return default
+        return default
 
-# Save data to file
+# Save data to file (thread-safe with atomic write)
 def save_data(file, data):
-    with open(file, 'w') as f:
-        json.dump(data, f, indent=4)
+    with _file_lock:
+        # Write to temp file first, then rename for atomicity
+        temp_file = file + '.tmp'
+        try:
+            with open(temp_file, 'w') as f:
+                json.dump(data, f, indent=4)
+            os.replace(temp_file, file)  # Atomic on POSIX systems
+        except Exception:
+            if os.path.exists(temp_file):
+                os.remove(temp_file)
+            raise
+
+# Atomic read-modify-write operation for file data
+def update_data(file, default, update_fn):
+    """
+    Atomically load data, apply update_fn, and save.
+    update_fn receives the current data and should return the modified data.
+    """
+    with _file_lock:
+        if os.path.exists(file):
+            try:
+                with open(file, 'r') as f:
+                    data = json.load(f)
+            except (json.JSONDecodeError, IOError):
+                data = default
+        else:
+            data = default
+
+        data = update_fn(data)
+
+        temp_file = file + '.tmp'
+        try:
+            with open(temp_file, 'w') as f:
+                json.dump(data, f, indent=4)
+            os.replace(temp_file, file)
+        except Exception:
+            if os.path.exists(temp_file):
+                os.remove(temp_file)
+            raise
+
+        return data
 
 def check_token_validity(auth_token):
     """Check if an auth token is still valid by making a lightweight API call"""
@@ -64,14 +111,14 @@ def check_token_validity(auth_token):
         return False
 
 def get_restaurant_name(restaurant_id):
-    """Get restaurant name from cache or fetch from API"""
+    """Get restaurant name from cache or fetch from API (thread-safe)"""
+    # First check cache with lock
     cache = load_data(RESTAURANT_CACHE_FILE, {})
-
-    # Return from cache if exists
     if restaurant_id in cache:
         return cache[restaurant_id]
 
-    # Fetch from API
+    # Fetch from API (without holding lock to avoid blocking other threads)
+    name = None
     try:
         headers = {
             'Authorization': 'ResyAPI api_key="VbWk7s3L4KiK5fzlO7JD3Q5EYolJI7n5"',
@@ -83,14 +130,20 @@ def get_restaurant_name(restaurant_id):
         r = requests.get(f'https://api.resy.com/3/venue?id={restaurant_id}', headers=headers)
         if r.status_code == 200:
             name = r.json().get('name', f'Restaurant {restaurant_id}')
-            # Save to cache
-            cache[restaurant_id] = name
-            save_data(RESTAURANT_CACHE_FILE, cache)
-            return name
     except Exception as e:
         print(f"Could not fetch restaurant name for {restaurant_id}: {e}")
 
-    return f"Restaurant {restaurant_id}"
+    if name is None:
+        return f"Restaurant {restaurant_id}"
+
+    # Atomically update cache (re-check in case another thread added it)
+    def update_cache(cache):
+        if restaurant_id not in cache:
+            cache[restaurant_id] = name
+        return cache
+
+    update_data(RESTAURANT_CACHE_FILE, {}, update_cache)
+    return name
 
 def send_task_reminders():
     """Send Discord summary of all tasks on bot startup"""
@@ -210,24 +263,27 @@ def send_task_reminders():
 # Send reminders on startup
 send_task_reminders()
 
-# Save scheduled task to file for persistence
+# Save scheduled task to file for persistence (thread-safe)
 def save_scheduled_task(job_id, task_index, schedule_time, repeat, duration, schedule_date=""):
-    scheduled_tasks = load_data(SCHEDULED_TASKS_FILE, [])
-    scheduled_tasks.append({
-        'job_id': job_id,
-        'task_index': task_index,
-        'schedule_time': schedule_time,
-        'schedule_date': schedule_date,
-        'repeat': repeat,
-        'duration': duration
-    })
-    save_data(SCHEDULED_TASKS_FILE, scheduled_tasks)
+    def add_task(scheduled_tasks):
+        scheduled_tasks.append({
+            'job_id': job_id,
+            'task_index': task_index,
+            'schedule_time': schedule_time,
+            'schedule_date': schedule_date,
+            'repeat': repeat,
+            'duration': duration
+        })
+        return scheduled_tasks
 
-# Remove scheduled task from file
+    update_data(SCHEDULED_TASKS_FILE, [], add_task)
+
+# Remove scheduled task from file (thread-safe)
 def remove_scheduled_task_from_file(job_id):
-    scheduled_tasks = load_data(SCHEDULED_TASKS_FILE, [])
-    scheduled_tasks = [t for t in scheduled_tasks if t['job_id'] != job_id]
-    save_data(SCHEDULED_TASKS_FILE, scheduled_tasks)
+    def remove_task(scheduled_tasks):
+        return [t for t in scheduled_tasks if t['job_id'] != job_id]
+
+    update_data(SCHEDULED_TASKS_FILE, [], remove_task)
 
 # Reload scheduled tasks on startup
 def reload_scheduled_tasks():
@@ -984,10 +1040,11 @@ def show_reservations():
         action = show_reservation_details(res)
         
         if action == 'cancel':
-            # Remove the cancelled reservation from the list
-            reservations.pop(res_index)
-            # Save updated reservations
-            save_data(RESERVATIONS_FILE, reservations)
+            # Remove the cancelled reservation from the list (thread-safe)
+            resy_token_to_remove = res['resy_token']
+            def remove_by_token(reservations_data):
+                return [r for r in reservations_data if r['resy_token'] != resy_token_to_remove]
+            reservations = update_data(RESERVATIONS_FILE, [], remove_by_token)
             # If all reservations are cancelled, exit the function
             if not reservations:
                 click.echo('No more reservations.')
@@ -1050,9 +1107,10 @@ def cancel_reservation(auth_token, resy_token):
         response = requests.post('https://api.resy.com/3/cancel', headers=headers, data=data, proxies=proxy, verify=False)
         if response.status_code == 200:
             click.echo(click.style('Reservation cancelled successfully!', fg='green'))
-            reservations = load_data(RESERVATIONS_FILE, [])
-            reservations = [res for res in reservations if res['resy_token'] != resy_token]
-            save_data(RESERVATIONS_FILE, reservations)
+            # Thread-safe removal from reservations file
+            def remove_reservation(reservations):
+                return [res for res in reservations if res['resy_token'] != resy_token]
+            update_data(RESERVATIONS_FILE, [], remove_reservation)
         else:
             click.echo(click.style('Failed to cancel reservation.', fg='red'))
     except Exception as e:
@@ -1194,12 +1252,15 @@ def run_task_with_timeout(task_index, duration, job_id):
         proxies = None
 
     task = tasks[task_index]
-    running_tasks[job_id] = {
-        'thread': threading.current_thread(),
-        'start_time': time.time(),
-        'duration': duration,
-        'task': task
-    }
+
+    # Thread-safe addition to running_tasks
+    with _running_tasks_lock:
+        running_tasks[job_id] = {
+            'thread': threading.current_thread(),
+            'start_time': time.time(),
+            'duration': duration,
+            'task': task
+        }
 
     try:
         run_tasks_concurrently([task], info['capsolver_key'], info['capmonster_key'], proxies, info['discord_webhook'])
@@ -1208,8 +1269,9 @@ def run_task_with_timeout(task_index, duration, job_id):
     finally:
         time.sleep(duration)
         print(f"Task {job_id} completed after {duration} seconds")
-        if job_id in running_tasks:
-            del running_tasks[job_id]
+        # Thread-safe removal from running_tasks
+        with _running_tasks_lock:
+            running_tasks.pop(job_id, None)
 
 # Reload scheduled tasks on startup (must be after start_and_stop_task is defined)
 reload_scheduled_tasks()
@@ -1238,7 +1300,10 @@ def view_scheduled_tasks():
                 click.echo(f"{i+1}) {task_name} - Next run: {next_run}")
         
         click.echo("\nRunning Tasks:")
-        for i, (job_id, task_info) in enumerate(running_tasks.items()):
+        # Thread-safe copy of running_tasks for iteration
+        with _running_tasks_lock:
+            running_tasks_snapshot = dict(running_tasks)
+        for i, (job_id, task_info) in enumerate(running_tasks_snapshot.items()):
             elapsed = time.time() - task_info['start_time']
             click.echo(f"{i+1}) Task ID: {job_id}, Running for: {elapsed:.2f}s, Max duration: {task_info['duration']}s")
         
@@ -1290,27 +1355,37 @@ def remove_scheduled_task(jobs):
     time.sleep(2)
 
 def stop_running_task():
-    if not running_tasks:
-        click.echo("No running tasks to stop.")
-        time.sleep(2)
-        return
-    
-    choices = [(f"Task {i+1}: {job_id}", job_id) for i, (job_id, _) in enumerate(running_tasks.items())]
+    # Thread-safe check and snapshot
+    with _running_tasks_lock:
+        if not running_tasks:
+            click.echo("No running tasks to stop.")
+            time.sleep(2)
+            return
+        choices = [(f"Task {i+1}: {job_id}", job_id) for i, (job_id, _) in enumerate(running_tasks.items())]
+
     questions = [
         inquirer.List('job_id',
                       message="Select a task to stop",
                       choices=choices)
     ]
     answers = inquirer.prompt(questions)
-    
+
     job_id = answers['job_id']
-    if job_id in running_tasks:
-        running_tasks[job_id]['thread'].join(0.1)  # Give the thread a chance to finish
-        if job_id in running_tasks:
-            del running_tasks[job_id]
-        click.echo(f"Stopped running task: {job_id}")
-    else:
-        click.echo(f"Task {job_id} is no longer running.")
+    # Thread-safe access and removal
+    with _running_tasks_lock:
+        task_info = running_tasks.get(job_id)
+        if task_info:
+            thread = task_info['thread']
+        else:
+            click.echo(f"Task {job_id} is no longer running.")
+            time.sleep(2)
+            return
+
+    thread.join(0.1)  # Give the thread a chance to finish (outside lock to avoid deadlock)
+
+    with _running_tasks_lock:
+        running_tasks.pop(job_id, None)
+    click.echo(f"Stopped running task: {job_id}")
     time.sleep(2)
 
 def start_tasks():

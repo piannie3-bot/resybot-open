@@ -1,17 +1,9 @@
 [
     {
-        "job_id": "task_0_20260213203106_45a280",
+        "job_id": "task_0_20260301220712_29bcfd",
         "task_index": 0,
-        "schedule_time": "09:00",
-        "schedule_date": "2026-02-14",
-        "repeat": "Once",
-        "duration": 10
-    },
-    {
-        "job_id": "task_1_20260213203413_dc7e0b",
-        "task_index": 1,
         "schedule_time": "00:00",
-        "schedule_date": "2026-02-14",
+        "schedule_date": "2026-03-02",
         "repeat": "Once",
         "duration": 10
     }
