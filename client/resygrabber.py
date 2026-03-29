@@ -1,3 +1,4 @@
+
 import click
 import inquirer
 import json
@@ -9,13 +10,11 @@ import re
 import uuid
 import urllib.parse
 import requests
-from datetime import datetime
 import datetime
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.jobstores.memory import MemoryJobStore
 import threading
-import time
 from task_executor import run_tasks_concurrently
 
 scheduler = BackgroundScheduler()
@@ -34,7 +33,7 @@ PROXIES_FILE = 'proxies.json'
 INFO_FILE = 'info.json'
 ACCESS_KEY_FILE = 'access_key.json'
 ACCOUNTS_FILE = 'accounts.json'
-RESERVATIONS_FILE = 'resrevations.json'
+RESERVATIONS_FILE = 'reservations.json'
 SCHEDULED_TASKS_FILE = 'scheduled_tasks.json'
 RESTAURANT_CACHE_FILE = 'restaurant_cache.json'
 
@@ -109,6 +108,32 @@ def check_token_validity(auth_token):
         return r.status_code == 200
     except Exception:
         return False
+
+def fetch_payment_id(auth_token):
+    """Fetch the user's first saved payment method ID from the Resy API"""
+    try:
+        headers = {
+            'Authorization': 'ResyAPI api_key="VbWk7s3L4KiK5fzlO7JD3Q5EYolJI7n5"',
+            'X-Resy-Auth-Token': auth_token,
+            'X-Resy-Universal-Auth': auth_token,
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+            'Accept': 'application/json',
+            'Origin': 'https://resy.com',
+            'Referer': 'https://resy.com/',
+        }
+        r = requests.get('https://api.resy.com/2/user', headers=headers, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            print(f'[DEBUG] /2/user full response: {json.dumps(data, indent=2)}')
+            payment_methods = data.get('payment_methods', [])
+            if payment_methods:
+                return payment_methods[0]['id']
+        else:
+            print(f'[DEBUG] /2/user returned status {r.status_code}: {r.text}')
+        return None
+    except Exception as e:
+        print(f'[DEBUG] fetch_payment_id error: {e}')
+        return None
 
 def get_restaurant_name(restaurant_id):
     """Get restaurant name from cache or fetch from API (thread-safe)"""
@@ -255,7 +280,7 @@ def send_task_reminders():
     message = "\n".join(lines)
 
     try:
-        requests.post(webhook_url, json={"content": message})
+        requests.post(webhook_url, json={"content": message}, timeout=5)
         print(f"Sent startup summary for {len(tasks)} task(s) to Discord")
     except Exception as e:
         print(f"Failed to send Discord summary: {e}")
@@ -264,7 +289,7 @@ def send_task_reminders():
 send_task_reminders()
 
 # Save scheduled task to file for persistence (thread-safe)
-def save_scheduled_task(job_id, task_index, schedule_time, repeat, duration, schedule_date=""):
+def save_scheduled_task(job_id, task_index, schedule_time, repeat, duration, schedule_date="", day_of_week=""):
     def add_task(scheduled_tasks):
         scheduled_tasks.append({
             'job_id': job_id,
@@ -272,7 +297,8 @@ def save_scheduled_task(job_id, task_index, schedule_time, repeat, duration, sch
             'schedule_time': schedule_time,
             'schedule_date': schedule_date,
             'repeat': repeat,
-            'duration': duration
+            'duration': duration,
+            'day_of_week': day_of_week,
         })
         return scheduled_tasks
 
@@ -301,8 +327,9 @@ def reload_scheduled_tasks():
                 scheduler.add_job(start_and_stop_task, 'cron', args=[task_index, duration, job_id],
                                   hour=schedule_time.hour, minute=schedule_time.minute, id=job_id)
             elif repeat == 'Weekly':
+                day_of_week = task_data.get('day_of_week', 'mon')
                 scheduler.add_job(start_and_stop_task, 'cron', args=[task_index, duration, job_id],
-                                  day_of_week='mon-sun', hour=schedule_time.hour, minute=schedule_time.minute, id=job_id)
+                                  day_of_week=day_of_week, hour=schedule_time.hour, minute=schedule_time.minute, id=job_id)
             else:  # Once
                 if schedule_date_str:
                     schedule_date = datetime.datetime.strptime(schedule_date_str, "%Y-%m-%d").date()
@@ -338,6 +365,8 @@ def menu():
                           carousel=True)
         ]
         answers = inquirer.prompt(questions)
+        if not answers:
+            break
 
         if answers['choice'].startswith('1'):
             show_tasks()
@@ -357,6 +386,7 @@ def menu():
                 start_tasks()
             except Exception as e:
                 print(f"Error starting tasks: {e}")
+                input('Press Enter to continue...')
         elif answers['choice'].startswith('8'):
             schedule_tasks()
         elif answers['choice'].startswith('9'):
@@ -389,72 +419,6 @@ def show_tasks():
             delete_task(tasks)
         elif answers['task_choice'] == 'Back':
             break
-
-""" def add_task():
-    info = load_data(INFO_FILE, {})
-    accounts = load_data(ACCOUNTS_FILE, [])
-    captcha_services = []
-    if 'capsolver_key' in info:
-        captcha_services.append('CAPSolver')
-    if 'capmonster_key' in info:
-        captcha_services.append('CapMonster')
-
-    if not accounts:
-        click.echo('No accounts found. Please add accounts before adding tasks.')
-        return
-
-    account_choices = [
-        (f'{idx + 1}) Account Name: {account["account_name"]}', idx)
-        for idx, account in enumerate(accounts)
-    ]
-
-    questions = [
-        inquirer.List('account_choice', message="Select an account for this task:", choices=account_choices),
-        inquirer.Text('restaurant_id', message="Please enter the restaurant ID:"),
-        inquirer.Text('party_sz', message="Please enter the party sizes (comma-separated, e.g., 2,3,4):"),
-        inquirer.Text('start_date', message="Please enter the start date (YYYY-MM-DD):"),
-        inquirer.Text('end_date', message="Please enter the end date (YYYY-MM-DD):"),
-        inquirer.Text('start_time', message="Please enter the start time (Hour only, 0-23):"),
-        inquirer.Text('end_time', message="Please enter the end time (Hour only, 0-23):"),
-    ]
-    if captcha_services:
-        questions.append(inquirer.List('captcha_service',
-                                       message="Select the CAPTCHA solving service:",
-                                       choices=captcha_services))
-    questions.append(inquirer.Text('delay', message="Enter the delay in milliseconds:"))
-    questions.append(inquirer.Confirm('save_task', message="Do you want to save these tasks?", default=True))
-
-    answers = inquirer.prompt(questions)
-
-    if answers['save_task']:
-        selected_account_index = answers['account_choice']
-        selected_account = accounts[selected_account_index]
-        
-        # Parse multiple party sizes
-        party_sizes = [int(size.strip()) for size in answers['party_sz'].split(',') if size.strip().isdigit()]
-
-        tasks = load_data(TASKS_FILE, [])
-
-        for party_size in party_sizes:
-            task = {
-                'account_name': selected_account['account_name'],
-                'auth_token': selected_account['auth_token'],
-                'payment_id': selected_account['payment_id'],
-                'restaurant_id': answers['restaurant_id'],
-                'party_sz': party_size,
-                'start_date': answers['start_date'],
-                'end_date': answers['end_date'],
-                'start_time': int(answers['start_time']),
-                'end_time': int(answers['end_time']),
-                'captcha_service': answers.get('captcha_service'),
-                'delay': int(answers['delay'])
-            }
-            tasks.append(task)
-
-        save_data(TASKS_FILE, tasks)
-    else:
-        click.echo('Tasks not saved.')
- """
 
 def add_task():
     info = load_data(INFO_FILE, {})
@@ -517,8 +481,7 @@ def add_task():
         # Parse multiple party sizes
         party_sizes = [int(size.strip()) for size in task_answers['party_sz'].split(',') if size.strip().isdigit()]
 
-        tasks = load_data(TASKS_FILE, [])
-
+        new_tasks = []
         for selected_account_index in selected_account_indices:
             selected_account = accounts[selected_account_index]
             for party_size in party_sizes:
@@ -536,9 +499,9 @@ def add_task():
                     'captcha_service': task_answers.get('captcha_service'),
                     'delay': int(task_answers['delay'])
                 }
-                tasks.append(task)
+                new_tasks.append(task)
 
-        save_data(TASKS_FILE, tasks)
+        update_data(TASKS_FILE, [], lambda existing: existing + new_tasks)
         click.echo(f'Tasks saved for {len(selected_account_indices)} accounts.')
     else:
         click.echo('Tasks not saved.')
@@ -557,8 +520,44 @@ def delete_task(tasks):
     answers = inquirer.prompt(questions)
     if answers['task_to_delete'] != 'Cancel':
         task_index = int(answers['task_to_delete'].split(')')[0]) - 1
-        valid_tasks.pop(task_index)
-        save_data(TASKS_FILE, valid_tasks)
+        task_to_remove = valid_tasks[task_index]
+        # Find absolute index in full task list before removing
+        all_tasks_now = load_data(TASKS_FILE, [])
+        try:
+            absolute_index = all_tasks_now.index(task_to_remove)
+        except ValueError:
+            absolute_index = None
+
+        def remove_task(all_tasks):
+            result = list(all_tasks)
+            try:
+                result.remove(task_to_remove)
+            except ValueError:
+                pass
+            return result
+        update_data(TASKS_FILE, [], remove_task)
+
+        # Remove orphaned scheduled tasks and shift indices down
+        if absolute_index is not None:
+            orphaned_job_ids = []
+            def update_scheduled(scheduled):
+                updated = []
+                for st in scheduled:
+                    if st['task_index'] == absolute_index:
+                        orphaned_job_ids.append(st['job_id'])
+                        continue
+                    if st['task_index'] > absolute_index:
+                        st = dict(st)
+                        st['task_index'] -= 1
+                    updated.append(st)
+                return updated
+            update_data(SCHEDULED_TASKS_FILE, [], update_scheduled)
+            for job_id in orphaned_job_ids:
+                try:
+                    scheduler.remove_job(job_id)
+                except Exception:
+                    pass
+
         click.echo('Task deleted!')
 
 # Manage Proxies
@@ -591,15 +590,13 @@ def add_proxy():
         inquirer.Text('proxies', message="Enter the proxies (separated by commas):")
     ]
     answers = inquirer.prompt(questions)
-    proxies = load_data(PROXIES_FILE, [])  # Reload proxies to get the latest list
     new_proxies = [proxy.strip() for proxy in answers['proxies'].split(',')]
-    proxies.extend(new_proxies)
-    save_data(PROXIES_FILE, proxies)
+    update_data(PROXIES_FILE, [], lambda proxies: proxies + new_proxies)
     click.echo('Proxies added!')
 
 def delete_proxy():
     while True:
-        proxies = load_data(PROXIES_FILE, [])  # Reload proxies to get the latest list
+        proxies = load_data(PROXIES_FILE, [])
         proxy_choices = [f'{idx + 1}) {proxy}' for idx, proxy in enumerate(proxies)]
         questions = [
             inquirer.List('proxy_to_delete',
@@ -607,13 +604,19 @@ def delete_proxy():
                           choices=proxy_choices + ['Cancel'])
         ]
         answers = inquirer.prompt(questions)
-        if answers['proxy_to_delete'] != 'Cancel':
-            proxy_index = int(answers['proxy_to_delete'].split(')')[0]) - 1
-            proxies.pop(proxy_index)
-            save_data(PROXIES_FILE, proxies)
-            click.echo('Proxy deleted!')
         if answers['proxy_to_delete'] == 'Cancel':
             break
+        proxy_index = int(answers['proxy_to_delete'].split(')')[0]) - 1
+        proxy_to_remove = proxies[proxy_index]
+        def remove_proxy(all_proxies):
+            result = list(all_proxies)
+            try:
+                result.remove(proxy_to_remove)
+            except ValueError:
+                pass
+            return result
+        update_data(PROXIES_FILE, [], remove_proxy)
+        click.echo('Proxy deleted!')
 
 def delete_all_proxies():
     questions = [
@@ -722,19 +725,22 @@ def manage_accounts():
             break
 
 def add_account():
-    accounts = load_data(ACCOUNTS_FILE, [])
-    
     auth_token = input("Enter your Resy Auth Token: ").strip()
-    payment_id = input("Enter your Resy Payment ID: ").strip()
     account_name = input("Enter a name for this account: ").strip()
-    
+
+    click.echo('Fetching payment method...')
+    payment_id = fetch_payment_id(auth_token)
+    if payment_id is None:
+        click.echo('No payment method found. Please add a card to your Resy account first, then try again.')
+        return
+
+    click.echo(f'Payment method found: {payment_id}')
     account = {
         'auth_token': auth_token,
         'payment_id': payment_id,
         'account_name': account_name
     }
-    accounts.append(account)
-    save_data(ACCOUNTS_FILE, accounts)
+    update_data(ACCOUNTS_FILE, [], lambda accounts: accounts + [account])
     click.echo('Account added!')
 
 def delete_account():
@@ -751,12 +757,21 @@ def delete_account():
     answers = inquirer.prompt(questions)
     if answers['account_to_delete'] != 'Cancel':
         account_index = int(answers['account_to_delete'].split(')')[0]) - 1
-        accounts.pop(account_index)
-        save_data(ACCOUNTS_FILE, accounts)
+        account_to_remove = accounts[account_index]
+        def remove_account(all_accounts):
+            result = list(all_accounts)
+            try:
+                result.remove(account_to_remove)
+            except ValueError:
+                pass
+            return result
+        update_data(ACCOUNTS_FILE, [], remove_account)
         click.echo('Account deleted!')
 
 def get_random_proxy():
     proxies = load_data(PROXIES_FILE, [])
+    if not proxies:
+        return None
     proxy = random.choice(proxies)
     ip_port, user_pass = proxy.rsplit(':', 2)[0], proxy.rsplit(':', 2)[1:]
     proxiesObj = {
@@ -766,11 +781,10 @@ def get_random_proxy():
     return proxiesObj
 
 def generate_accounts():
-    accounts = load_data(ACCOUNTS_FILE, [])
     info = load_data(INFO_FILE, {})
     proxies = load_data(PROXIES_FILE, [])
 
-    if(info['capsolver_key'] == ''):
+    if info.get('capsolver_key', '') == '':
         click.echo('Please set your CAPSolver Key before generating accounts.')
         return
 
@@ -848,15 +862,10 @@ def generate_accounts():
     new_account = {
         'account_name': answers['acc_name'],
         'auth_token': accToken,
-        'payment_id': '0'  # Placeholder payment ID
+        'payment_id': 0  # Placeholder payment ID
     }
 
-    # Add the new account to the accounts list
-    accounts.append(new_account)
-
-    # Save updated accounts list to file
-    save_data(ACCOUNTS_FILE, accounts)
-
+    update_data(ACCOUNTS_FILE, [], lambda accs: accs + [new_account])
     print(f'Account "{answers["acc_name"]}" has been saved successfully!')
 
     #client_secret = setup_intent(accToken, proxiesObj)
@@ -876,7 +885,8 @@ def get_captcha_token(captcha_key, site_key, url, proxy):
     return solve_recaptcha_v2(PAGE_URL, PAGE_KEY, proxy)
 
 def solve_recaptcha_v2(url, key, proxy):
-    while True:
+    max_retries = 10
+    for attempt in range(max_retries):
         try:
             solution = capsolver.solve({
                 "type": "RecaptchaV2Task",
@@ -887,14 +897,13 @@ def solve_recaptcha_v2(url, key, proxy):
 
             if 'gRecaptchaResponse' in solution:
                 return solution['gRecaptchaResponse']
-            else:
-                # Handle cases where the solution does not include the expected key
-                print("CAPTCHA solving is still in progress or there was an error.")
-                time.sleep(3)  # Wait before trying again
-
+            print(f"CAPTCHA solving in progress (attempt {attempt + 1}/{max_retries}).")
+            time.sleep(3)
         except Exception as e:
-            print(f"An error occurred: {e}")
-            time.sleep(5)  # Wait before trying again
+            print(f"An error occurred: {e} (attempt {attempt + 1}/{max_retries})")
+            time.sleep(5)
+    print("CAPTCHA solving failed after maximum retries.")
+    return None
 
 def setup_intent(accToken, proxiesObj):
     headers = {
@@ -944,43 +953,6 @@ def setPm(accToken, pm, proxiesObj):
     }
     response = requests.post('https://api.resy.com/3/stripe/payment_method', headers=headers, data=data, proxies=proxiesObj, verify=False)
     print(f'Final Response: {response.text}')
-
-""" def get_captcha_token(captcha_key, site_key, url, proxies):
-    proxy = random.choice(proxies)
-    payload = {
-        "clientKey": captcha_key,
-        "task": {
-            "type": "RecaptchaV2Task",
-            "websiteKey": site_key,
-            "websiteURL": url,
-            "proxy": f'{proxy}'
-        }
-    }
-
-    res = requests.post('https://api.capsolver.com/createtask', json=payload)
-    print(f'res: {res}')
-    print(f'res text: {res.text}')
-    resp = res.json()
-    print(f'resp: {resp}')
-    print
-    task_id = resp.get('taskId')
-    if not task_id:
-        print(f'Failed to get CAPTCHA token: {resp}')
-        return
-    print(f"Got taskId: {task_id} / Getting result...")
-
-    while True:
-        time.sleep(3)  # delay
-        payload = {"clientKey": captcha_key, "taskId": task_id}
-        res = requests.post("https://api.capsolver.com/getTaskResult", json=payload)
-        resp = res.json()
-        status = resp.get("status")
-        if status == "ready":
-            print(f'Solved, response: {resp.get("solution")}')
-            return resp.get("solution", {}).get('gRecaptchaResponse')
-        if status == "failed" or resp.get("errorId"):
-            print("Solve failed! response:", res.text)
-            return """
 
 def list_reservations():
     accounts = load_data(ACCOUNTS_FILE, [])
@@ -1081,7 +1053,8 @@ def show_reservation_details(res):
 
 def cancel_reservation(auth_token, resy_token):
     click.echo('Cancelling reservation...')
-    proxy = get_random_proxy()
+    proxies = load_data(PROXIES_FILE, [])
+    proxy = get_random_proxy() if proxies else None
     headers = {
         'Host': 'api.resy.com',
         'Accept': 'application/json, text/plain, */*',
@@ -1118,7 +1091,8 @@ def cancel_reservation(auth_token, resy_token):
     input('Press Enter to continue...')
         
 def get_account_reservations(auth_token, account_name):
-    proxy = get_random_proxy()
+    proxies = load_data(PROXIES_FILE, [])
+    proxy = get_random_proxy() if proxies else None
     headers = {
         'Host': 'api.resy.com',
         'Authorization': 'ResyAPI api_key="VbWk7s3L4KiK5fzlO7JD3Q5EYolJI7n5"',
@@ -1151,10 +1125,9 @@ def get_account_reservations(auth_token, account_name):
     account_reservations = []
     for reservation in res['reservations']:
         venue_id = str(reservation['venue']['id'])
-        res = {
+        reservation_data = {
             'resy_token': reservation['resy_token'],
             'auth_token': auth_token,
-            #'venue': reservation['venue']['id'],
             'venue': res['venues'][venue_id]['name'],
             'first_name': reservation['party'][0]['first_name'],
             'last_name': reservation['party'][0]['last_name'],
@@ -1166,8 +1139,8 @@ def get_account_reservations(auth_token, account_name):
         }
 
         if 'cancellation' in reservation and reservation['cancellation'] and 'date_refund_cut_off' in reservation['cancellation']:
-            res['cancel_by'] = reservation['cancellation']['date_refund_cut_off']
-        account_reservations.append(res)
+            reservation_data['cancel_by'] = reservation['cancellation']['date_refund_cut_off']
+        account_reservations.append(reservation_data)
         
     return account_reservations
 
@@ -1188,15 +1161,23 @@ def schedule_tasks():
     ]
     answers = inquirer.prompt(questions)
 
-    # Ask for date if "Once" is selected
+    # Ask for date if "Once" is selected, or day-of-week if "Weekly"
+    schedule_date_str = ""
+    day_of_week_str = ""
     if answers['repeat'] == 'Once':
         date_question = [
             inquirer.Text('schedule_date', message="Enter the date to run (YYYY-MM-DD, or press Enter for today):", default="")
         ]
         date_answer = inquirer.prompt(date_question)
         schedule_date_str = date_answer['schedule_date']
-    else:
-        schedule_date_str = ""
+    elif answers['repeat'] == 'Weekly':
+        dow_question = [
+            inquirer.List('day_of_week',
+                          message="Which day of the week?",
+                          choices=['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'])
+        ]
+        dow_answer = inquirer.prompt(dow_question)
+        day_of_week_str = dow_answer['day_of_week']
 
     time_question = [
         inquirer.Text('schedule_time', message="Enter the time to schedule (HH:MM):")
@@ -1214,7 +1195,7 @@ def schedule_tasks():
                           hour=schedule_time.hour, minute=schedule_time.minute, id=job_id)
     elif answers['repeat'] == 'Weekly':
         scheduler.add_job(start_and_stop_task, 'cron', args=[task_index, duration, job_id],
-                          day_of_week='mon-sun', hour=schedule_time.hour, minute=schedule_time.minute, id=job_id)
+                          day_of_week=day_of_week_str, hour=schedule_time.hour, minute=schedule_time.minute, id=job_id)
     else:  # Once
         if schedule_date_str:
             schedule_date = datetime.datetime.strptime(schedule_date_str, "%Y-%m-%d").date()
@@ -1227,7 +1208,7 @@ def schedule_tasks():
                           run_date=next_run, id=job_id)
 
     # Save to file for persistence
-    save_scheduled_task(job_id, task_index, time_answer['schedule_time'], answers['repeat'], duration, schedule_date_str)
+    save_scheduled_task(job_id, task_index, time_answer['schedule_time'], answers['repeat'], duration, schedule_date_str, day_of_week_str)
 
     if answers['repeat'] == 'Once' and schedule_date_str:
         click.echo(f"Task scheduled to run on {schedule_date_str} at {schedule_time.strftime('%H:%M')} for {duration} seconds")
@@ -1252,26 +1233,35 @@ def run_task_with_timeout(task_index, duration, job_id):
         proxies = None
 
     task = tasks[task_index]
+    stop_event = threading.Event()
+
+    task_thread = threading.Thread(
+        target=run_tasks_concurrently,
+        args=([task], info['capsolver_key'], info['capmonster_key'], proxies, info['discord_webhook'], stop_event),
+        daemon=True
+    )
 
     # Thread-safe addition to running_tasks
     with _running_tasks_lock:
         running_tasks[job_id] = {
-            'thread': threading.current_thread(),
+            'thread': task_thread,
+            'stop_event': stop_event,
             'start_time': time.time(),
             'duration': duration,
             'task': task
         }
 
-    try:
-        run_tasks_concurrently([task], info['capsolver_key'], info['capmonster_key'], proxies, info['discord_webhook'])
-    except Exception as e:
-        print(f"Error starting scheduled task: {e}")
-    finally:
-        time.sleep(duration)
-        print(f"Task {job_id} completed after {duration} seconds")
-        # Thread-safe removal from running_tasks
-        with _running_tasks_lock:
-            running_tasks.pop(job_id, None)
+    task_thread.start()
+    task_thread.join(timeout=duration)
+
+    if task_thread.is_alive():
+        print(f"Task {job_id} timed out after {duration} seconds, stopping...")
+        stop_event.set()
+        task_thread.join()
+
+    print(f"Task {job_id} completed")
+    with _running_tasks_lock:
+        running_tasks.pop(job_id, None)
 
 # Reload scheduled tasks on startup (must be after start_and_stop_task is defined)
 reload_scheduled_tasks()
@@ -1374,14 +1364,14 @@ def stop_running_task():
     # Thread-safe access and removal
     with _running_tasks_lock:
         task_info = running_tasks.get(job_id)
-        if task_info:
-            thread = task_info['thread']
-        else:
+        if not task_info:
             click.echo(f"Task {job_id} is no longer running.")
             time.sleep(2)
             return
+        stop_event = task_info.get('stop_event')
 
-    thread.join(0.1)  # Give the thread a chance to finish (outside lock to avoid deadlock)
+    if stop_event:
+        stop_event.set()
 
     with _running_tasks_lock:
         running_tasks.pop(job_id, None)
@@ -1395,19 +1385,30 @@ def start_tasks():
     
     if not tasks:
         click.echo('No tasks found. Please add tasks before starting.')
+        input('Press Enter to continue...')
         return
     if not proxies:
         click.echo('No proxies found. Running without proxies.')
         proxies = None
     if not info:
         click.echo('No user info found. Please set user info before starting.')
+        input('Press Enter to continue...')
         return
 
+    required_keys = ['capsolver_key', 'capmonster_key', 'discord_webhook']
+    missing = [k for k in required_keys if k not in info]
+    if missing:
+        click.echo(f'Missing info fields: {", ".join(missing)}. Please set them via "3) Info".')
+        input('Press Enter to continue...')
+        return
+
+    stop_event = threading.Event()
     try:
-        run_tasks_concurrently(tasks, info['capsolver_key'], info['capmonster_key'], proxies, info['discord_webhook'])
+        run_tasks_concurrently(tasks, info['capsolver_key'], info['capmonster_key'], proxies, info['discord_webhook'], stop_event)
     except Exception as e:
         print(f"Error starting tasks: {e}")
-    
+        input('Press Enter to continue...')
+
     input('Press Enter to continue...')
     
 

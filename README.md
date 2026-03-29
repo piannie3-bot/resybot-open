@@ -1,7 +1,5 @@
 # ResyGrabber - Restaurant Reservation Bot
 
-\*THIS USED TO BE CLOSED SOURCE, BUT I QUICKLY VIBECODED AN OPEN SOURCE VERSION WITHOUT LICENSING LOGIC. I ALSO QUICKLY MERGED TWO REPOS INTO THIS ONE. PLEASE LET ME KNOW IF ANY ISSUES ARE ENCOUNTERED, BUT YOU CAN AT LEAST EXAMINE THE CODE. FEEL FREE TO REACH OUT TO LEARN MORE ABOUT HOW I CREATED THIS!
-
 This is an open-source tool to help manage restaurant reservations on Resy.com. It was previously a SaaS product but has been converted to a locally runnable application with no authentication required. This is the first SAAS product that I've released and it was very fun to work on! I am open sourcing this now though because New York passed laws making it illegal to sell dinner reservations.
 
 ## Features

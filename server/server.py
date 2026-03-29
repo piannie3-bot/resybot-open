@@ -51,7 +51,7 @@ async def index():
 @app.post("/api/get-details")
 async def get_details(data: DetailsRequest):
     logger.info("Get details endpoint accessed")
-    logger.debug(f"Request data: {data}")
+    logger.debug(f"Request received for restaurant {data.restaurant_id}, day {data.day}")
 
     # Format proxy URLs
     formatted_proxies = None
@@ -73,19 +73,18 @@ async def get_details(data: DetailsRequest):
     async with httpx.AsyncClient(proxies=formatted_proxies, verify=False) as client:
         try:
             response = await client.get(url, headers=headers)
-            logger.info(f"Get Details API request made to {url} using proxy {formatted_proxies}")
+            logger.info(f"Get Details API request made for restaurant {data.restaurant_id} using proxy {formatted_proxies}")
             logger.debug(f"Response status code: {response.status_code}")
             response.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            logger.warning(f"Resy API error for restaurant {data.restaurant_id}: {e.response.status_code}")
+            raise HTTPException(status_code=e.response.status_code, detail=f"Failed to get details for restaurant {data.restaurant_id}")
         except httpx.ProxyError as e:
             logger.error(f"Proxy error: {e}")
             raise HTTPException(status_code=500, detail="Proxy connection failed")
         except httpx.RequestError as e:
             logger.error(f"Request failed: {e}")
             raise HTTPException(status_code=500, detail="Request failed")
-
-    if response.status_code != 200:
-        logger.warning(f"Failed to get details for restaurant {data.restaurant_id}. Status code: {response.status_code}")
-        raise HTTPException(status_code=response.status_code, detail=f"Failed to get details for restaurant {data.restaurant_id}")
 
     response_data = response.json()
     logger.info("Details retrieved successfully")
@@ -94,7 +93,7 @@ async def get_details(data: DetailsRequest):
 @app.post("/api/book-reservation")
 async def book_reservation(data: ReservationRequest):
     logger.info("Book reservation endpoint accessed")
-    logger.debug(f"Request data: {data}")
+    logger.debug(f"Booking request received for payment_id {data.payment_id}")
 
     # Format proxy URLs
     formatted_proxies = None

@@ -16,7 +16,7 @@ def format_proxy(proxy_str):
         'https': f'http://{user}:{password}@{ip}:{port}',
     }
 
-def execute_task(task, capsolver_key, capmonster_key, proxies, webhook_url):
+def execute_task(task, capsolver_key, capmonster_key, proxies, webhook_url, stop_event=None):
     print(f"[DEBUG] Starting task for restaurant {task.get('restaurant_id', 'unknown')}", flush=True)
     auth_token = task['auth_token']
     payment_id = task['payment_id']
@@ -42,13 +42,13 @@ def execute_task(task, capsolver_key, capmonster_key, proxies, webhook_url):
     #captcha_key = capsolver_key if captcha_service == 'CAPSolver' else capmonster_key
     #capsolver.api_key = captcha_key
 
-    while True:
+    while stop_event is None or not stop_event.is_set():
         try:
             select_proxy = format_proxy(random.choice(proxies)) if proxies else None
 
             url = f"https://api.resy.com/4/venue/calendar?venue_id={restaurant_id}&num_seats={party_sz}&start_date={start_date}&end_date={end_date}"
             print(f"[{restaurant_id}] Checking availability...", flush=True)
-            response = requests.get(url, headers=headers, proxies=select_proxy, verify=False)
+            response = requests.get(url, headers=headers, proxies=select_proxy, verify=False, timeout=10)
 
             if response.status_code != 200:
                 error_msg = response.json().get('message', response.text) if response.text else 'No response'
@@ -68,7 +68,7 @@ def execute_task(task, capsolver_key, capmonster_key, proxies, webhook_url):
                 if entry['inventory']['reservation'] == 'available':
 
                     url2 = f"https://api.resy.com/4/find?lat=0&long=0&day={entry['date']}&party_size={party_sz}&venue_id={restaurant_id}"
-                    response2 = requests.get(url2, headers=headers, proxies=select_proxy, verify=False)
+                    response2 = requests.get(url2, headers=headers, proxies=select_proxy, verify=False, timeout=10)
 
                     if response2.status_code != 200:
                         error_msg = response2.json().get('message', response2.text) if response2.text else 'No response'
@@ -112,7 +112,10 @@ def execute_task(task, capsolver_key, capmonster_key, proxies, webhook_url):
             print(f'[ERROR] Failed to execute task: {e}', flush=True)
             traceback.print_exc()
             break
-        time.sleep(delay/1000)
+        if stop_event is not None:
+            stop_event.wait(delay / 1000)
+        else:
+            time.sleep(delay / 1000)
 
 
 def get_captcha_token(captcha_key, site_key, url, proxy):
@@ -136,8 +139,8 @@ def get_details(day, party_size, config_token, restaurant_id, headers, select_pr
         'select_proxy': select_proxy
     }
 
-    response = requests.post(url, json=payload)
-    
+    response = requests.post(url, json=payload, timeout=10)
+
     if response.status_code != 200:
         print(f'Failed to get details for restaurant {restaurant_id} - {response.text} - {response.status_code}')
         return
@@ -159,17 +162,21 @@ def book_reservation(book_token, auth_token, payment_id, day, party_size, restau
         'select_proxy': select_proxy
     }
 
-    response = requests.post(url, json=payload)
+    response = requests.post(url, json=payload, timeout=10)
 
     return response.json()
         
 def send_discord_notification(webhook_url, message):
-    data = {"content": message}
-    requests.post(webhook_url, json=data)
+    if not webhook_url:
+        return
+    try:
+        requests.post(webhook_url, json={"content": message}, timeout=5)
+    except Exception:
+        pass
 
-def run_tasks_concurrently(tasks, capsolver_key, capmonster_key, proxies, webhook_url):
-    with ThreadPoolExecutor(max_workers=len(tasks)) as executor:
-        futures = [executor.submit(execute_task, task, capsolver_key, capmonster_key, proxies, webhook_url) for task in tasks]
+def run_tasks_concurrently(tasks, capsolver_key, capmonster_key, proxies, webhook_url, stop_event=None):
+    with ThreadPoolExecutor(max_workers=min(len(tasks), 10)) as executor:
+        futures = [executor.submit(execute_task, task, capsolver_key, capmonster_key, proxies, webhook_url, stop_event) for task in tasks]
         for future in as_completed(futures):
             try:
                 future.result()
